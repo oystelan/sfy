@@ -2,3 +2,6 @@
 sfy_processing.egg-info
 .env
 build
+*.nc
+__pycache__/
+.idea/

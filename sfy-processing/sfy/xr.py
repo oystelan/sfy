@@ -913,6 +913,126 @@ def retime_individual(ds, fs=None):
     return ds
 
 
+def retime_anchored(ds, eps_gap=3.):
+    """
+    Re-time by anchoring every package to its GPS ``package_start`` timestamp and
+    interpolating each sample's time PIECEWISE-LINEARLY between consecutive
+    anchors.
+
+    Unlike :func:`retime`, which lays the whole segment on a single global
+    frequency (``t = t0 + k/fs``), this tracks the *local* sample rate between
+    each pair of GPS anchors. The IMU ODR is not stable (it varies by several
+    percent within a segment, see issue #125), so a single ``fs`` for a multi-
+    minute segment leaves a slow linear drift: every anchor lands on its true
+    GPS time, but samples in between are stretched/compressed by the difference
+    between the segment-average rate and the local rate. Anchoring per package
+    removes that drift — the reconstruction is re-pinned to absolute GPS time at
+    every package (~every 1024 samples), so the error stays bounded by the
+    anchor-timestamp resolution (~1 ms) instead of accumulating.
+
+    This is the most time-consistent reconstruction obtainable from the
+    available anchor points. The resulting axis is no longer perfectly uniform
+    (sample spacing varies slightly between anchors), but ``estimated_frequency``
+    is set to the unbiased aggregate rate (total samples / total anchor-spanned
+    time) for spectral/displacement use.
+
+    Note: :func:`estimate_frequency` (used by :func:`retime`) takes the *median*
+    of per-package-pair rates, which is biased low when the rate is noisy — a
+    further reason the single-frequency ``retime`` runs slow. This function does
+    not use it.
+    """
+    logger.debug('Re-timing dataset by per-package GPS anchoring..')
+    N = ds.attrs.get('package_length', 1024)
+    n = len(ds.package_start.values)  # number of packages
+
+    assert n * N == len(
+        ds.time), "dataset has been sliced in time before retiming"
+
+    # Split at gaps (same policy as retime) and process each segment on its own
+    # so we never interpolate sample times across a data gap.
+    PDT = N / ds.attrs['frequency'] * 1000.  # length of package in ms
+    pdt = np.diff(
+        ds.package_start.values).astype('timedelta64[ms]').astype(float)
+
+    if len(pdt) > 1 and np.max(np.abs(pdt)) >= (PDT + eps_gap * 1000.):
+        logger.warning(
+            f"Re-timing (anchored): gap greater than {eps_gap}s in data, splitting and combining"
+        )
+        dss = list(
+            map(lambda s: retime_anchored(s, eps_gap),
+                splitby_segments(ds, eps_gap)))
+        logger.info(f'Split dataset into {len(dss)} segments, merging..')
+        return concat(dss)
+
+    # Global sample index and GPS time of each package's anchor sample.
+    ps = ds.package_start.values.astype('datetime64[ns]')
+    all_idx = np.arange(0, n) * N + ds.offset.values
+    valid = ~np.isnat(ps)
+
+    if np.count_nonzero(valid) < 2:
+        # Not enough GPS anchors to interpolate a rate; fall back to the
+        # single-frequency retime for this segment.
+        logger.warning(
+            'retime_anchored: fewer than two valid GPS anchors, '
+            'falling back to single-frequency retime for this segment.')
+        return retime(ds, eps_gap=eps_gap)
+
+    anchor_idx = all_idx[valid].astype(np.float64)
+    anchor_t = ps[valid].astype('int64').astype(np.float64)  # ns since epoch
+
+    if np.any(np.diff(anchor_t) <= 0):
+        logger.warning(
+            'retime_anchored: non-monotonic GPS anchor timestamps (jitter); '
+            'interpolated times may not be strictly increasing.')
+
+    # Extend with end anchors so the leading/trailing partial packages are
+    # extrapolated at their local rate instead of being clamped (np.interp
+    # holds the endpoint value outside the anchor range, which would collapse
+    # those samples onto one timestamp).
+    slope0 = (anchor_t[1] - anchor_t[0]) / (anchor_idx[1] - anchor_idx[0])
+    slope1 = (anchor_t[-1] - anchor_t[-2]) / (anchor_idx[-1] - anchor_idx[-2])
+    last = n * N - 1
+    ext_idx = np.concatenate(([0.0], anchor_idx, [float(last)]))
+    ext_t = np.concatenate((
+        [anchor_t[0] - slope0 * anchor_idx[0]],
+        anchor_t,
+        [anchor_t[-1] + slope1 * (last - anchor_idx[-1])],
+    ))
+
+    sample_idx = np.arange(0, n * N, dtype=np.float64)
+    t_ns = np.interp(sample_idx, ext_idx, ext_t)
+    t = t_ns.astype('int64').astype('datetime64[ns]')
+
+    if 'fir_adjusted' in ds.attrs:
+        t = t + np.timedelta64(int(ds.attrs['fir_adjusted']),
+                               ds.attrs['fir_adjusted:unit'])
+
+    # Unbiased representative rate for dt / spectral use: total samples spanned
+    # by the anchors divided by the GPS time they span (NOT median of ratios).
+    span_samples = anchor_idx[-1] - anchor_idx[0]
+    span_seconds = (anchor_t[-1] - anchor_t[0]) / 1e9
+    fs = span_samples / span_seconds if span_seconds > 0 else ds.attrs[
+        'frequency']
+
+    assert len(t) == len(ds.w_z)
+    assert len(t) == len(ds.time)
+
+    oldtime = ds.time.values
+
+    ds = ds.assign_coords(
+        retime=('time', t),
+        oldtime=('time', oldtime)).set_index(time='retime').assign_attrs({
+            'estimated_frequency':
+            fs,
+            'estimated_frequency:unit':
+            'Hz',
+            'retimed':
+            'anchored'
+        })
+
+    return ds
+
+
 def fill_gaps(ds: xr.Dataset, fill_value=np.nan, eps_gap=3.) -> xr.Dataset:
     """
     Fill gaps with `fill_value` (default: nan) so that the time vector is approximately monotonously increasing.

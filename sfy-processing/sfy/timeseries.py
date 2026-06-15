@@ -289,8 +289,8 @@ class AxlTimeseries:
 
         # ds = sxr.unique_positions(ds)
         if retime:
-            logger.info('Re-timing dataset based on estimated frequency..')
-            ds = sxr.retime(ds)
+            logger.info('Re-timing dataset by per-package GPS anchoring..')
+            ds = sxr.retime_anchored(ds)
         else:
             fs = np.nanmedian(sxr.estimate_frequency(ds))
             logger.info(f'Not re-timing, estimated frequency to: {fs:.3f} Hz')
